@@ -9,10 +9,9 @@ from openai import OpenAI
 
 load_dotenv()
 
-# Читаем переменные окружения
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BOTMOTHER_TOKEN = os.getenv("BOTMOTHER_TOKEN")  # можно оставить пустым, тогда проверка заголовка отключится
-BASE_URL = os.getenv("BASE_URL")  # пример: https://img2img-server.onrender.com
+BOTMOTHER_TOKEN = os.getenv("BOTMOTHER_TOKEN")
+BASE_URL = os.getenv("BASE_URL")  # например: https://img2img-server.onrender.com
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY не задан в переменных окружения")
@@ -20,7 +19,6 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
-# Папка для сохранения готовых изображений
 os.makedirs("files", exist_ok=True)
 app.mount("/files", StaticFiles(directory="files"), name="files")
 
@@ -30,7 +28,7 @@ def test():
 
 @app.post("/img2img")
 def img2img(payload: dict, x_api_token: str = Header(None)):
-    # === Проверка секретного токена (если задан) ===
+    # токен
     if BOTMOTHER_TOKEN and x_api_token != BOTMOTHER_TOKEN:
         raise HTTPException(401, "Invalid X-Api-Token")
 
@@ -41,7 +39,7 @@ def img2img(payload: dict, x_api_token: str = Header(None)):
     if not prompt or not image_url:
         raise HTTPException(400, "Fields 'prompt' and 'image_url' are required")
 
-    # === Скачиваем картинку пользователя ===
+    # качаем исходную картинку
     try:
         resp = requests.get(image_url, timeout=25)
         resp.raise_for_status()
@@ -50,11 +48,11 @@ def img2img(payload: dict, x_api_token: str = Header(None)):
         raise HTTPException(400, f"Failed to download image: {e}")
 
     tmp_name = f"tmp_{uuid.uuid4().hex}.png"
-    with open(tmp_name, "wb") as f:
-        f.write(img_bytes)
-
-    # === Отправляем картинку + промт в OpenAI ===
     try:
+        with open(tmp_name, "wb") as f:
+            f.write(img_bytes)
+
+        # генерим редактированное изображение
         with open(tmp_name, "rb") as f:
             result = client.images.edits(
                 model="gpt-image-1",
@@ -63,18 +61,8 @@ def img2img(payload: dict, x_api_token: str = Header(None)):
                 size=size,
                 n=1,
             )
-    except Exception as e:
-        # удаляем временный файл и пробрасываем ошибку
-        if os.path.exists(tmp_name):
-            os.remove(tmp_name)
-        raise HTTPException(500, f"OpenAI error: {e}")
 
-    # чистим временный файл
-    if os.path.exists(tmp_name):
-        os.remove(tmp_name)
-
-    # === Получаем Base64 результата и сохраняем ===
-    try:
+        # сохраняем результат
         b64img = result.data[0].b64_json
         output_bytes = base64.b64decode(b64img)
         out_name = f"{uuid.uuid4().hex}.png"
@@ -82,8 +70,10 @@ def img2img(payload: dict, x_api_token: str = Header(None)):
         with open(out_path, "wb") as f:
             f.write(output_bytes)
     except Exception as e:
-        raise HTTPException(500, f"Failed to save image: {e}")
+        raise HTTPException(500, f"OpenAI or save error: {e}")
+    finally:
+        if os.path.exists(tmp_name):
+            os.remove(tmp_name)
 
-    # Публичный URL файла (если BASE_URL не задан — вернём относительный путь)
     public_url = f"{BASE_URL}/files/{out_name}" if BASE_URL else f"/files/{out_name}"
     return {"ok": True, "image_url": public_url}
