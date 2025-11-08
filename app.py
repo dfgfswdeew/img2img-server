@@ -37,7 +37,7 @@ def image_generate():
             "User-Agent": "RenderImageProxy/1.0",
         },
         json={
-            "model": "gpt-image-1",
+            "model": "dall-e-2",
             "prompt": prompt,
             "size": size,
             "n": 1
@@ -99,7 +99,7 @@ def image_edit():
         files.append(mask_tuple)
 
     form = {
-        "model": "gpt-image-1",
+        "model": "dall-e-2",
         "prompt": prompt,
         "size": size,
         "n": "1"
@@ -131,3 +131,4 @@ def image_edit():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "3000")))
+
