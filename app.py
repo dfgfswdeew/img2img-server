@@ -46,7 +46,7 @@ def image_generate():
                 "Content-Type": "application/json",
             },
             json={
-                "model": "dall-e-2",  # DALL·E 2, без верификации
+                "model": "gpt-image-1",  # DALL·E 2, без верификации
                 "prompt": prompt,
                 "size": size,
                 "n": 1,
@@ -145,7 +145,7 @@ def image_edit():
     ]
 
     form = {
-        "model": "dall-e-2",
+        "model": "gpt-image-1",
         "prompt": prompt,
         "size": size,
         "n": "1",
@@ -184,3 +184,4 @@ def image_edit():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "3000")))
+
