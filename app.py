@@ -1,8 +1,9 @@
-import os, io, uuid, base64, requests
-from flask import Flask, request, jsonify, send_from_directory
+import os, uuid, base64, requests, json
+from flask import Flask, request, jsonify, send_from_directory, Response
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-image")  # Nano Banana семейство
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-image")
+BUILD_ID = os.getenv("BUILD_ID", "local")  # <- добавили
 
 app = Flask(__name__)
 
@@ -17,14 +18,17 @@ def save_png_and_url(png_bytes):
     name = f"{uuid.uuid4().hex}.png"
     out_dir = "/tmp"
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, name)
-    with open(path, "wb") as f:
+    with open(os.path.join(out_dir, name), "wb") as f:
         f.write(png_bytes)
     return f"{public_base()}/files/{name}"
 
 @app.get("/")
 def root():
-    return "Gemini nano-generate proxy ✅"
+    return f"Gemini nano-generate proxy ✅ build={BUILD_ID}"
+
+@app.get("/version")
+def version():
+    return {"build": BUILD_ID, "model": MODEL}
 
 @app.get("/health")
 def health():
@@ -34,22 +38,7 @@ def health():
 def files(fname):
     return send_from_directory("/tmp", fname, mimetype="image/png")
 
-@app.post("/nano/generate")
-def nano_generate():
-    if not GEMINI_API_KEY:
-        return bad("GEMINI_API_KEY is not set on server", 500)
-
-    try:
-        data = request.get_json(force=True) or {}
-    except Exception:
-        return bad("Invalid JSON")
-
-    prompt = data.get("prompt")
-    ref_url = data.get("reference_image_url")  # опционально
-    if not prompt:
-        return bad("Missing prompt")
-
-    # Текстовая часть. Просим НОВОЕ фото (чтобы избежать IMAGE_RECITATION).
+def _call_gemini(prompt: str, ref_url: str | None):
     parts = [{
         "text": (
             "Create a NEW photorealistic image from the instructions below. "
@@ -57,58 +46,65 @@ def nano_generate():
             f"Instructions: {prompt}"
         )
     }]
-
-    # Если прислали референс — приклеиваем как inline_data (не редактируем, а ориентируемся).
     if ref_url:
-        try:
-            r = requests.get(ref_url, timeout=60, stream=True,
-                             headers={"User-Agent": "RenderGeminiProxy/1.0"})
-            r.raise_for_status()
-            img = r.content
-            mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
-            if mime not in ("image/png", "image/jpeg", "image/webp"):
-                mime = "image/jpeg"
-            parts.append({
-                "inline_data": {
-                    "mime_type": mime,
-                    "data": base64.b64encode(img).decode("utf-8")
-                }
-            })
-        except Exception as e:
-            return bad(f"Cannot fetch reference image: {e}")
+        r = requests.get(ref_url, timeout=60, stream=True,
+                         headers={"User-Agent": "RenderGeminiProxy/1.0"})
+        r.raise_for_status()
+        mime = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0]
+        if mime not in ("image/png", "image/jpeg", "image/webp"):
+            mime = "image/jpeg"
+        parts.append({"inline_data": {
+            "mime_type": mime,
+            "data": base64.b64encode(r.content).decode("utf-8")
+        }})
 
     payload = {
         "contents": [{"parts": parts}],
-        "generationConfig": {
-            "responseModalities": ["IMAGE"],
-            "temperature": 0.8
-        }
+        "generationConfig": {"responseModalities": ["IMAGE"], "temperature": 0.8}
     }
-
-    try:
-        g = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
-            headers={
-                "x-goog-api-key": GEMINI_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=180
-        )
-        body = g.json()
-    except Exception as e:
-        return bad(f"Gemini network error: {e}", 502)
-
+    g = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
+        headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+        json=payload, timeout=180
+    )
+    body = g.json()
     if not g.ok:
-        return bad({"upstream_error": body}, g.status_code)
-
-    # Достаём картинку (inline base64) из ответа
+        raise RuntimeError(json.dumps({"upstream_error": body}))
     try:
         parts_out = body["candidates"][0]["content"]["parts"]
         b64 = next(p["inline_data"]["data"] for p in parts_out if "inline_data" in p)
-        img_bytes = base64.b64decode(b64)
+        return base64.b64decode(b64)
     except Exception:
-        return bad({"error": "No image in response", "raw": body}, 502)
+        raise RuntimeError(json.dumps({"error": "No image in response", "raw": body}))
 
-    url = save_png_and_url(img_bytes)
+def _handle_generate(req_json):
+    if not GEMINI_API_KEY:
+        return bad("GEMINI_API_KEY is not set on server", 500)
+    prompt = (req_json or {}).get("prompt")
+    ref_url = (req_json or {}).get("reference_image_url")
+    if not prompt:
+        return bad("Missing prompt")
+    img = _call_gemini(prompt, ref_url)
+    url = save_png_and_url(img)
+    return url
+
+# Старый эндпоинт (оставляем, но он тоже возвращает только URL)
+@app.post("/nano/generate")
+def nano_generate():
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return bad("Invalid JSON")
+    url = _handle_generate(data)
     return jsonify({"url": url})
+
+# Новый «железобетонный» эндпоинт только с URL
+@app.post("/nano/generate_url")
+def nano_generate_url():
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return bad("Invalid JSON")
+    url = _handle_generate(data)
+    # Возвращаем вручную, чтобы исключить любые сторонние сериализации
+    return Response(json.dumps({"url": url}), mimetype="application/json")
