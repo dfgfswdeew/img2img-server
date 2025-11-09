@@ -1,187 +1,102 @@
-import os
-import io
-import requests
-from flask import Flask, request, jsonify
-from PIL import Image
+import os, io, uuid, base64, requests
+from flask import Flask, request, jsonify, send_from_directory
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+MODEL = "gemini-2.5-flash-image"  # aka Nano Banana
 
 app = Flask(__name__)
 
-def _bad_request(msg):
-    return jsonify({"error": msg}), 400
+def bad(msg, code=400): return jsonify({"error": msg}), code
 
-def _proxy_error(details, status=502):
-    return jsonify({"error": "OpenAI error", "details": details}), status
+def save_png_and_url(png_bytes):
+    fname = f"{uuid.uuid4().hex}.png"
+    out_dir = "/tmp"
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, fname)
+    with open(path, "wb") as f:
+        f.write(png_bytes)
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    return f"{base}/files/{fname}" if base else f"/files/{fname}"
 
 @app.get("/")
 def health():
-    return "Proxy is running ✅"
+    return "Gemini image edit proxy ✅"
 
-# ============================================================
-# ================  /image/generate  ==========================
-# ============================================================
+@app.get("/files/<path:fname>")
+def files(fname):
+    return send_from_directory("/tmp", fname, mimetype="image/png")
 
-@app.post("/image/generate")
-def image_generate():
+@app.post("/nano/edit")
+def nano_edit():
+    if not GEMINI_API_KEY:
+        return bad("GEMINI_API_KEY is not set on server", 500)
+
     try:
-        data = request.get_json(force=True, silent=False)
+        data = request.get_json(force=True)
     except Exception:
-        return _bad_request("Invalid JSON")
+        return bad("Invalid JSON")
 
-    prompt = (data or {}).get("prompt")
-    size = (data or {}).get("size", "1024x1024")
-
-    if not OPENAI_API_KEY:
-        return _bad_request("OPENAI_API_KEY is not set on server")
-    if not prompt:
-        return _bad_request("Missing prompt")
-
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/images/generations",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "User-Agent": "RenderImageProxy/1.0",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-image-1",  # DALL·E 2, без верификации
-                "prompt": prompt,
-                "size": size,
-                "n": 1,
-            },
-            timeout=120,
-        )
-    except Exception as e:
-        return _proxy_error(f"Upstream request failed: {e}")
-
-    try:
-        payload = resp.json()
-    except Exception:
-        return _proxy_error(resp.text)
-
-    if not resp.ok:
-        return _proxy_error(payload)
-
-    url = (payload.get("data") or [{}])[0].get("url")
-    if not url:
-        return _proxy_error("No url in response")
-    return jsonify({"url": url})
-
-# ============================================================
-# ================  /image/edit  ==============================
-# ============================================================
-
-@app.post("/image/edit")
-def image_edit():
-    try:
-        data = request.get_json(force=True, silent=False)
-    except Exception:
-        return _bad_request("Invalid JSON")
-
-    prompt = (data or {}).get("prompt")
     image_url = (data or {}).get("image_url")
-    mask_url = (data or {}).get("mask_url")
-    size = (data or {}).get("size", "1024x1024")
+    prompt    = (data or {}).get("prompt") or "Edit the image as requested."
+    if not image_url:
+        return bad("Missing image_url")
 
-    if not OPENAI_API_KEY:
-        return _bad_request("OPENAI_API_KEY is not set on server")
-    if not prompt or not image_url:
-        return _bad_request("Missing prompt or image_url")
-
-    # --- 1. Загружаем картинку ---
+    # 1) Скачиваем изображение пользователя
     try:
-        img_resp = requests.get(
-            image_url,
-            stream=True,
-            timeout=60,
-            headers={"User-Agent": "RenderImageProxy/1.0 (+contact@example.com)"}
-        )
+        r = requests.get(image_url, timeout=60, stream=True,
+                         headers={"User-Agent": "RenderGeminiProxy/1.0"})
+        r.raise_for_status()
     except Exception as e:
-        return _bad_request(f"Cannot fetch image: {e}")
+        return bad(f"Cannot fetch image: {e}")
 
-    if not img_resp.ok:
-        return _bad_request(f"Cannot fetch image, status={img_resp.status_code}")
+    img_bytes = r.content
+    mime = (r.headers.get("Content-Type") or "image/png").split(";")[0]
+    if mime not in ("image/png", "image/jpeg", "image/webp"):
+        mime = "image/png"
 
-    # --- 2. Конвертируем в RGBA (DALL·E 2 требует альфа-канал) ---
-    try:
-        src = Image.open(io.BytesIO(img_resp.content))
-        rgba = src.convert("RGBA")
-        buf = io.BytesIO()
-        rgba.save(buf, format="PNG")
-        buf.seek(0)
-    except Exception as e:
-        return _bad_request(f"Cannot process image: {e}")
-
-    # --- 3. Маска ---
-    mask_tuple = None
-    if mask_url:
-        try:
-            m_resp = requests.get(
-                mask_url,
-                stream=True,
-                timeout=60,
-                headers={"User-Agent": "RenderImageProxy/1.0 (+contact@example.com)"}
-            )
-            if not m_resp.ok:
-                return _bad_request(f"Cannot fetch mask, status={m_resp.status_code}")
-            mask_tuple = ("mask", ("mask.png", m_resp.content, "image/png"))
-        except Exception as e:
-            return _bad_request(f"Cannot fetch mask: {e}")
-    else:
-        # Создаём пустую прозрачную маску на весь кадр
-        w, h = rgba.size
-        empty = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        m_buf = io.BytesIO()
-        empty.save(m_buf, format="PNG")
-        m_buf.seek(0)
-        mask_tuple = ("mask", ("mask.png", m_buf.getvalue(), "image/png"))
-
-    # --- 4. Готовим multipart для запроса к OpenAI ---
-    files = [
-        ("image", ("image.png", buf.getvalue(), "image/png")),
-        mask_tuple,
-    ]
-
-    form = {
-        "model": "gpt-image-1",
-        "prompt": prompt,
-        "size": size,
-        "n": "1",
+    # 2) Формируем запрос к Gemini (inline base64)
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {
+                    "mime_type": mime,
+                    "data": base64.b64encode(img_bytes).decode("utf-8")
+                }}
+            ]
+        }],
+        "generationConfig": { "responseModalities": ["IMAGE"] }
     }
 
-    # --- 5. Отправляем запрос к OpenAI ---
     try:
-        resp = requests.post(
-            "https://api.openai.com/v1/images/edits",
+        g = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent",
             headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "User-Agent": "RenderImageProxy/1.0",
+                "x-goog-api-key": GEMINI_API_KEY,
+                "Content-Type": "application/json",
             },
-            data=form,
-            files=files,
-            timeout=180,
+            json=payload,
+            timeout=180
         )
     except Exception as e:
-        return _proxy_error(f"Upstream request failed: {e}")
+        return bad(f"Gemini network error: {e}", 502)
+
+    # 3) Разбираем ответ (ищем inline base64 с картинкой)
+    try:
+        body = g.json()
+    except Exception:
+        return bad(f"Gemini non-JSON: {g.text}", 502)
+
+    if not g.ok:
+        return bad({"upstream_error": body}, g.status_code)
 
     try:
-        payload = resp.json()
+        parts = (body["candidates"][0]["content"]["parts"])
+        b64 = next(p["inline_data"]["data"] for p in parts if "inline_data" in p)
+        png = base64.b64decode(b64)
     except Exception:
-        return _proxy_error(resp.text)
+        return bad({"error": "No image in response", "raw": body}, 502)
 
-    if not resp.ok:
-        return _proxy_error(payload)
-
-    url = (payload.get("data") or [{}])[0].get("url")
-    if not url:
-        return _proxy_error("No url in response")
-
+    # 4) Сохраняем и возвращаем URL
+    url = save_png_and_url(png)
     return jsonify({"url": url})
-
-# ============================================================
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "3000")))
-
